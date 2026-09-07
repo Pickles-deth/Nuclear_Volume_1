@@ -1,8 +1,23 @@
 import os
-os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL','2')
-os.environ.setdefault('OMP_NUM_THREADS','1')
-os.environ.setdefault('TF_NUM_INTRAOP_THREADS','1')
-os.environ.setdefault('TF_NUM_INTEROP_THREADS','1')
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("TF_NUM_INTRAOP_THREADS", "1")
+os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
+os.environ["TQDM_DISABLE"] = "1"
+
+# Streamlit Cloud では tqdm の出力先が切れて BrokenPipeError になることがあるため、
+# tqdm 自体も無効化しておく。
+try:
+    import tqdm as _tqdm_module
+    _orig_tqdm = _tqdm_module.tqdm
+
+    def _silent_tqdm(*args, **kwargs):
+        kwargs["disable"] = True
+        return _orig_tqdm(*args, **kwargs)
+
+    _tqdm_module.tqdm = _silent_tqdm
+except Exception:
+    pass
 
 import gc, re, time
 from io import BytesIO
@@ -85,30 +100,143 @@ def model():
     from stardist.models import StarDist3D
     return StarDist3D.from_pretrained('3D_demo')
 
-def run_sd(roi,prob,nms,tz,tyx):
+def run_sd(seed_roi, prob, nms, tz, tyx):
+    """
+    StarDist 3Dを小さいseed ROIに実行。
+    Streamlit Cloudでtqdmの出力先が切れてBrokenPipeErrorになる場合があるため、
+    BrokenPipeErrorを捕捉し、進捗表示を無効化した状態で再試行する。
+    """
     from csbdeep.utils import normalize
-    x=normalize(roi,1,99.8,axis=(0,1,2)).astype(np.float32,copy=False)
-    probs=[]
-    for p in [prob,min(prob,.30),min(prob,.25),min(prob,.20),min(prob,.15)]:
-        p=round(max(.05,float(p)),3)
-        if p not in probs: probs.append(p)
-    plans=[(tz,tyx,tyx),(4,2,2),(4,3,3),(8,3,3),(8,4,4)]
-    last=None; mem=0; zero=0
+
+    x = normalize(
+        np.asarray(seed_roi),
+        1,
+        99.8,
+        axis=(0, 1, 2),
+    ).astype(np.float32, copy=False)
+
+    probs = [
+        float(prob),
+        min(float(prob), 0.30),
+        min(float(prob), 0.25),
+        min(float(prob), 0.20),
+        min(float(prob), 0.15),
+    ]
+    probs = list(
+        dict.fromkeys(
+            round(max(0.05, float(p)), 3)
+            for p in probs
+        )
+    )
+
+    tile_plans = [
+        (int(tz), int(tyx), int(tyx)),
+        (2, 2, 2),
+        (4, 2, 2),
+        (4, 3, 3),
+        (8, 3, 3),
+        (8, 4, 4),
+    ]
+
+    # duplicateを除外
+    uniq = []
+    seen = set()
+    for nt in tile_plans:
+        nt = tuple(max(1, int(v)) for v in nt)
+        if nt not in seen:
+            seen.add(nt)
+            uniq.append(nt)
+    tile_plans = uniq
+
+    memory_retries = 0
+    zero_retries = 0
+    broken_pipe_retries = 0
+
     try:
         for p in probs:
-            for nt in plans:
+            for nt in tile_plans:
                 try:
-                    labels,_=model().predict_instances(x,axes='ZYX',prob_thresh=p,nms_thresh=float(nms),n_tiles=tuple(map(int,nt)),verbose=False)
-                    labels=labels.astype(np.int32,copy=False)
-                    if int(labels.max())>0: return labels,nt,p,mem,zero
-                    zero+=1; break
+                    labels, _ = model().predict_instances(
+                        x,
+                        axes="ZYX",
+                        prob_thresh=float(p),
+                        nms_thresh=float(nms),
+                        n_tiles=tuple(map(int, nt)),
+                        verbose=False,
+                    )
+
+                    labels = labels.astype(np.int32, copy=False)
+
+                    if int(labels.max()) > 0:
+                        return (
+                            labels,
+                            nt,
+                            float(p),
+                            int(memory_retries),
+                            int(zero_retries),
+                        )
+
+                    zero_retries += 1
+
+                    # 同じprobでtileだけ増やしても、0検出は改善しにくいため
+                    # 次のprob thresholdへ進む
+                    break
+
+                except BrokenPipeError:
+                    broken_pipe_retries += 1
+                    gc.collect()
+
+                    # tqdmを再度明示的に無効化
+                    try:
+                        import tqdm as _tqdm_module
+                        _orig = getattr(_tqdm_module, "_chatgpt_orig_tqdm", None)
+                        if _orig is None:
+                            _orig = _tqdm_module.tqdm
+                            _tqdm_module._chatgpt_orig_tqdm = _orig
+
+                        def _silent_tqdm_local(*args, **kwargs):
+                            kwargs["disable"] = True
+                            return _orig(*args, **kwargs)
+
+                        _tqdm_module.tqdm = _silent_tqdm_local
+                    except Exception:
+                        pass
+
+                    # 何度も同じBrokenPipeが出る場合は次tileへ
+                    if broken_pipe_retries >= 3:
+                        continue
+                    continue
+
                 except Exception as e:
-                    s=str(e).lower()
-                    if not any(k in s for k in ['oom','out of memory','resourceexhausted','unable to allocate']): raise
-                    mem+=1; last=e; gc.collect()
-        return np.zeros(roi.shape,np.int32),(tz,tyx,tyx),probs[-1],mem,zero
+                    msg = str(e).lower()
+
+                    if (
+                        isinstance(e, MemoryError)
+                        or "out of memory" in msg
+                        or "resourceexhausted" in msg
+                        or "unable to allocate" in msg
+                        or "oom" in msg
+                    ):
+                        memory_retries += 1
+                        gc.collect()
+                        continue
+
+                    raise
+
+        return (
+            np.zeros(seed_roi.shape, dtype=np.int32),
+            tile_plans[-1],
+            float(probs[-1]),
+            int(memory_retries),
+            int(zero_retries),
+        )
+
     finally:
-        del x; gc.collect()
+        try:
+            del x
+        except Exception:
+            pass
+        gc.collect()
 
 def choose_object(labels,shape,ty,tx):
     m=int(labels.max())
