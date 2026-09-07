@@ -14,4 +14,5 @@ streamlit-image-coordinates==0.4.1
 torch
 torchvision
 timm
+plotly
 git+https://github.com/ChaoningZhang/MobileSAM.git
