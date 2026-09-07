@@ -1059,21 +1059,85 @@ def _best_overlapping_component_2d(mask2d, reference2d, dilation_px=3):
     return comp
 
 
+def _connected_hysteresis_from_seed(
+    smoothed,
+    seed,
+    xy_guard,
+    high_thr,
+    low_thr,
+    close_iterations=2,
+):
+    """
+    Grow only the weak-signal voxels that are connected to the StarDist seed.
+
+    This is a seed-constrained hysteresis segmentation:
+      - high_thr marks reliable DAPI signal
+      - low_thr permits faint nuclear edge signal
+      - propagation starts from the StarDist seed, so isolated background noise
+        is not accepted simply because it exceeds low_thr.
+    """
+    seed = np.asarray(seed, dtype=bool)
+    guard3d = xy_guard[None, :, :]
+
+    strong = (smoothed >= float(high_thr)) & guard3d
+    weak = (smoothed >= float(low_thr)) & guard3d
+
+    # The StarDist seed must always remain valid.
+    strong |= seed
+    weak |= seed
+
+    # Join tiny salt-and-pepper gaps before propagation.  This is deliberately
+    # modest; propagation is still constrained to the seed-connected region.
+    structure3d = ndi.generate_binary_structure(3, 2)
+    if int(close_iterations) > 0:
+        weak = ndi.binary_closing(
+            weak,
+            structure=structure3d,
+            iterations=int(close_iterations),
+        )
+        weak |= seed
+
+    # Seed-constrained hysteresis. This is the key change for dotted masks.
+    grown = ndi.binary_propagation(
+        seed,
+        structure=structure3d,
+        mask=weak,
+    )
+
+    # Make sure reliable signal immediately connected to the grown object is
+    # included, then fill holes slice-by-slice for a solid nuclear cross-section.
+    grown |= (strong & ndi.binary_dilation(grown, structure=structure3d, iterations=1))
+
+    for z in range(grown.shape[0]):
+        if np.any(grown[z]):
+            grown[z] = ndi.binary_fill_holes(grown[z])
+
+    grown &= guard3d
+    grown |= seed
+    return grown.astype(bool)
+
+
 def expand_seed_mask_full_z(
     roi_full_z,
     seed_full_z,
     threshold_factor=0.82,
     xy_guard_dilation_px=10,
-    tail_threshold_ratio=0.62,
-    max_gap_slices=1,
+    edge_sensitivity=0.65,
+    max_gap_slices=2,
 ):
     """
-    Expand a StarDist seed through the full Z range without running StarDist
-    on the full Z-stack.
+    Full-Z whole-nucleus segmentation designed for both smooth and noisy DAPI.
 
-    Central/bright nucleus is segmented at the normal threshold.  Then the
-    upper and lower faint tails are followed slice-by-slice using a lower
-    threshold, but only when they spatially continue from the preceding slice.
+    Key points:
+      1) StarDist is used only as a seed.
+      2) A light Gaussian filter suppresses salt-and-pepper noise.
+      3) Seed-constrained hysteresis grows through faint edge signal without
+         accepting disconnected background speckles.
+      4) Remaining faint Z tails are followed slice-by-slice by continuity.
+
+    edge_sensitivity: 0.0..1.0
+      Higher -> lower weak threshold, slightly stronger smoothing/closing,
+      therefore more permissive at faint XY/Z edges.
     """
     if seed_full_z is None or not np.any(seed_full_z):
         return None, {}
@@ -1089,18 +1153,32 @@ def expand_seed_mask_full_z(
             "z_tracked_slices": 0,
         }
 
-    # float32 only for this XY-cropped ROI, not for the full uploaded image.
+    sensitivity = float(np.clip(edge_sensitivity, 0.0, 1.0))
+
+    # float32 only for this XY-cropped ROI, never for the whole uploaded stack.
     norm = np.asarray(x, dtype=np.float32)
     norm = np.clip((norm - lo) / (hi - lo), 0, 1)
     seed = np.asarray(seed_full_z, dtype=bool)
 
-    xy_guard, xy_info = _make_nucleus_xy_guard(
+    # Light smoothing turns the dotted/noisy appearance into a continuous
+    # intensity field while preserving the macroscopic nuclear boundary.
+    smooth_sigma = 0.8 + 0.8 * sensitivity
+    smoothed = ndi.gaussian_filter(
         norm,
+        sigma=(0.55, smooth_sigma, smooth_sigma),
+        mode="nearest",
+    ).astype(np.float32, copy=False)
+
+    # Make the guard a little more permissive as edge sensitivity rises.
+    # It remains a 2D safety fence against runaway background growth.
+    effective_guard = int(round(int(xy_guard_dilation_px) + 8 * sensitivity))
+    xy_guard, xy_info = _make_nucleus_xy_guard(
+        smoothed,
         seed,
-        guard_dilation_px=int(xy_guard_dilation_px),
+        guard_dilation_px=effective_guard,
     )
 
-    sample = norm.ravel()
+    sample = smoothed.ravel()
     if sample.size > 1_000_000:
         step = max(1, sample.size // 1_000_000)
         sample = sample[::step]
@@ -1110,25 +1188,30 @@ def expand_seed_mask_full_z(
     except Exception:
         otsu = float(np.percentile(sample, 65))
 
-    core_thr = float(np.clip(otsu * float(threshold_factor), 0.03, 0.95))
-    tail_thr = float(np.clip(core_thr * float(tail_threshold_ratio), 0.025, core_thr))
+    high_thr = float(np.clip(otsu * float(threshold_factor), 0.03, 0.95))
 
-    core = norm >= core_thr
-    core |= seed
-    core &= xy_guard[None, :, :]
+    # At default sensitivity 0.65, faint-edge threshold is ~51% of high_thr.
+    # Range is deliberately bounded to avoid accepting nearly pure background.
+    weak_ratio = float(np.clip(0.72 - 0.32 * sensitivity, 0.38, 0.72))
+    low_thr = float(np.clip(high_thr * weak_ratio, 0.018, high_thr))
+    close_iterations = 1 + int(round(2 * sensitivity))
 
-    structure3d = ndi.generate_binary_structure(3, 1)
-    core = ndi.binary_closing(core, structure=structure3d, iterations=1)
-    for z in range(core.shape[0]):
-        core[z] = ndi.binary_fill_holes(core[z])
-    core &= xy_guard[None, :, :]
+    whole = _connected_hysteresis_from_seed(
+        smoothed=smoothed,
+        seed=seed,
+        xy_guard=xy_guard,
+        high_thr=high_thr,
+        low_thr=low_thr,
+        close_iterations=close_iterations,
+    )
 
+    # Keep only the 3D component that actually belongs to the seed.
     seed_overlap = ndi.binary_dilation(
         seed,
         structure=ndi.generate_binary_structure(3, 2),
         iterations=2,
     )
-    whole = _largest_component_overlapping_seed(core, seed_overlap)
+    whole = _largest_component_overlapping_seed(whole, seed_overlap)
     whole |= seed
     whole &= xy_guard[None, :, :]
 
@@ -1141,7 +1224,12 @@ def expand_seed_mask_full_z(
     end_z = int(z_present.max())
     tracked = 0
 
-    # Follow faint signal upward and downward. A one-slice miss is tolerated.
+    # Follow any remaining faint tail through Z.  The threshold becomes a
+    # little more permissive with edge sensitivity, but a component must
+    # spatially continue from the preceding nuclear slice.
+    z_tail_thr = float(np.clip(low_thr * (0.95 - 0.18 * sensitivity), 0.015, low_thr))
+    overlap_dilation = 3 + int(round(3 * sensitivity))
+
     for direction, first_z in [(-1, start_z - 1), (1, end_z + 1)]:
         z = first_z
         ref_z = start_z if direction < 0 else end_z
@@ -1149,25 +1237,27 @@ def expand_seed_mask_full_z(
         gap = 0
 
         while 0 <= z < whole.shape[0]:
-            candidate = (norm[z] >= tail_thr) & xy_guard
+            candidate = (smoothed[z] >= z_tail_thr) & xy_guard
             candidate = ndi.binary_closing(
                 candidate,
                 structure=np.ones((3, 3), dtype=bool),
-                iterations=1,
+                iterations=close_iterations,
             )
             candidate = ndi.binary_fill_holes(candidate)
 
             comp = _best_overlapping_component_2d(
                 candidate,
                 reference,
-                dilation_px=3,
+                dilation_px=overlap_dilation,
             )
 
             if np.any(comp):
-                # Prevent sudden explosion into background/neighboring nucleus.
                 prev_area = max(1, int(np.count_nonzero(reference)))
                 area = int(np.count_nonzero(comp))
-                if area <= max(prev_area * 3, prev_area + 200):
+
+                # Allow natural tapering/expansion, reject sudden runaway growth.
+                max_growth = 2.8 + 0.8 * sensitivity
+                if area <= max(prev_area * max_growth, prev_area + 250):
                     whole[z] = comp
                     reference = comp
                     tracked += 1
@@ -1181,13 +1271,24 @@ def expand_seed_mask_full_z(
                 break
             z += direction
 
+    # Final small closing makes the displayed contour a single solid outline
+    # instead of hundreds of tiny dots, while staying inside the XY guard.
+    final_structure = ndi.generate_binary_structure(3, 1)
+    whole = ndi.binary_closing(whole, structure=final_structure, iterations=1)
+    for z in range(whole.shape[0]):
+        if np.any(whole[z]):
+            whole[z] = ndi.binary_fill_holes(whole[z])
+
     whole |= seed
     whole &= xy_guard[None, :, :]
 
     info = {
         "otsu": float(otsu),
-        "threshold": float(core_thr),
-        "tail_threshold": float(tail_thr),
+        "threshold": float(high_thr),
+        "tail_threshold": float(z_tail_thr),
+        "weak_threshold": float(low_thr),
+        "edge_sensitivity": float(sensitivity),
+        "smoothing_sigma_xy": float(smooth_sigma),
         "threshold_factor_requested": float(threshold_factor),
         "threshold_factor_used": float(threshold_factor),
         "seed_voxels": int(np.count_nonzero(seed)),
@@ -1195,12 +1296,12 @@ def expand_seed_mask_full_z(
         "roi_fraction": float(np.count_nonzero(whole) / max(1, whole.size)),
         "xy_border_touch": bool(_touches_xy_border(whole, guard=2)),
         "xy_guard_fraction": float(np.count_nonzero(xy_guard) / xy_guard.size),
+        "effective_xy_guard_dilation": int(effective_guard),
         "z_tracked_slices": int(tracked),
         **xy_info,
     }
 
-    # Release the largest temporary array before returning on low-RAM hosts.
-    del norm, core
+    del norm, smoothed
     return whole.astype(bool), info
 
 def mask_touches_z_boundary(mask, guard_slices=1):
@@ -1297,6 +1398,7 @@ def analyze_candidates(
     max_z_expansions=2,
     whole_nucleus_threshold_factor=0.82,
     xy_guard_dilation_px=10,
+    edge_sensitivity=0.65,
 ):
     """
     Memory-safe pipeline.
@@ -1389,8 +1491,8 @@ def analyze_candidates(
             seed_full_z=seed_full,
             threshold_factor=float(whole_nucleus_threshold_factor),
             xy_guard_dilation_px=int(xy_guard_dilation_px),
-            tail_threshold_ratio=0.62,
-            max_gap_slices=1,
+            edge_sensitivity=float(edge_sensitivity),
+            max_gap_slices=2,
         )
 
         # From here on, ROI Z coordinates are full-stack coordinates.
@@ -1453,6 +1555,8 @@ def analyze_candidates(
             "Whole/seed ratio": round(float(expansion_ratio), 2),
             "DAPI threshold": round(float(mask_info.get("threshold", np.nan)), 4),
             "Tail threshold": round(float(mask_info.get("tail_threshold", np.nan)), 4),
+            "Weak threshold": round(float(mask_info.get("weak_threshold", np.nan)), 4),
+            "Edge sensitivity": round(float(mask_info.get("edge_sensitivity", edge_sensitivity)), 2),
             "Threshold factor used": mask_info.get("threshold_factor_used", np.nan),
             "XY border touch": bool(mask_info.get("xy_border_touch", False)),
             "Z tracked slices": int(mask_info.get("z_tracked_slices", 0)),
@@ -1906,6 +2010,25 @@ xy_guard_dilation_px = st.sidebar.slider(
     ),
 )
 
+edge_sensitivity_percent = st.sidebar.slider(
+    "核の端の感度",
+    min_value=0,
+    max_value=100,
+    value=65,
+    step=5,
+    help=(
+        "淡い核外周とZ上下端をどこまで拾うかを調整します。"
+        "高くすると端を拾いやすくなりますが、背景まで広がる場合は下げてください。"
+        "まず65、端が不足する場合は75→85の順で試してください。"
+    ),
+)
+edge_sensitivity = edge_sensitivity_percent / 100.0
+
+st.sidebar.caption(
+    "端が粒々になる画像では 70〜85 を推奨。"
+    "輪郭が明瞭な画像では 50〜65 から試してください。"
+)
+
 
 st.sidebar.header("⑥ Tiling")
 
@@ -2271,6 +2394,7 @@ if run_button:
                 whole_nucleus_threshold_factor
             ),
             xy_guard_dilation_px=int(xy_guard_dilation_px),
+            edge_sensitivity=float(edge_sensitivity),
         )
 
         total_time = time.perf_counter() - t_start
@@ -2404,6 +2528,8 @@ st.dataframe(
             "Whole/seed ratio",
             "DAPI threshold",
             "Tail threshold",
+            "Weak threshold",
+            "Edge sensitivity",
             "Threshold factor used",
             "XY border touch",
             "Z start",
@@ -2698,6 +2824,8 @@ with st.expander("解析条件"):
 **Whole nucleus threshold factor:** {whole_nucleus_threshold_factor:.2f}
 
 **XY guard dilation:** {xy_guard_dilation_px} px
+
+**Edge sensitivity:** {edge_sensitivity_percent} / 100
 
 **Volume formula:**
 voxel count × Pixel X × Pixel Y × Z spacing
