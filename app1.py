@@ -5,6 +5,7 @@ os.environ.setdefault('TF_NUM_INTRAOP_THREADS','1')
 os.environ.setdefault('TF_NUM_INTEROP_THREADS','1')
 
 import gc, re, time
+from io import BytesIO
 import urllib.request
 from pathlib import Path
 import numpy as np
@@ -16,12 +17,15 @@ from PIL import Image
 from streamlit_image_coordinates import streamlit_image_coordinates
 from scipy import ndimage as ndi
 from skimage.filters import gaussian, threshold_otsu
+from skimage.measure import marching_cubes
+from matplotlib.backends.backend_pdf import PdfPages
+import plotly.graph_objects as go
 
 st.set_page_config(page_title='3D Nuclear Volume Analyzer - AI Edge', page_icon='🧬', layout='wide')
 st.title('🧬 3D Nuclear Volume Analyzer - AI Edge')
 st.caption('StarDist 3D（AI）で核をseed検出し、背景補正＋2段階しきい値＋Z連続性で淡い外縁まで追跡します。')
 
-DEFAULTS={'raw':None,'sig':None,'cands':None,'records':None,'table':None,'done':False,'selected':None,'sam_click':None,'sam_2d':None,'sam_3d':None,'sam_target_nucleus':None,'sam_target_z':None}
+DEFAULTS={'raw':None,'sig':None,'cands':None,'records':None,'table':None,'done':False,'selected':None,'sam_click':None,'sam_2d':None,'sam_3d':None,'sam_target_nucleus':None,'sam_target_z':None,'report_pdf':None,'report_pdf_name':None}
 for k,v in DEFAULTS.items():
     if k not in st.session_state: st.session_state[k]=v
 
@@ -192,6 +196,270 @@ def overlay(raw,rec,z=None,mip=False):
     if np.any(mm):
         rgba=np.zeros((*mm.shape,4),np.float32); rgba[...,2]=1; rgba[...,3]=mm*.32; ax.imshow(rgba); ax.contour(mm,levels=[.5],colors=['cyan'],linewidths=2)
     ax.set_title(title); ax.axis('off'); fig.tight_layout(); return fig
+
+
+def make_3d_mask_figure(mask, px, py, dz, title="3D nuclear mask"):
+    """
+    最終bool maskから等値面を作り、Plotlyで回転可能な3D表示を返す。
+    軸は実寸 µm。
+    """
+    m = np.asarray(mask, dtype=np.uint8)
+
+    if m.ndim != 3 or not np.any(m):
+        return None
+
+    # marching_cubesが外周を閉じられるよう1 voxel pad
+    padded = np.pad(m, 1, mode="constant")
+
+    try:
+        verts, faces, _, _ = marching_cubes(
+            padded.astype(np.float32),
+            level=0.5,
+            spacing=(float(dz), float(py), float(px)),
+        )
+    except Exception:
+        return None
+
+    # padした1 voxel分を座標から戻す
+    verts[:, 0] -= float(dz)
+    verts[:, 1] -= float(py)
+    verts[:, 2] -= float(px)
+
+    # ブラウザ負荷を抑えるため、面数が非常に多い場合のみ間引く
+    max_faces = 120_000
+    if faces.shape[0] > max_faces:
+        step = int(np.ceil(faces.shape[0] / max_faces))
+        faces = faces[::step]
+
+    fig = go.Figure(
+        data=[
+            go.Mesh3d(
+                x=verts[:, 2],
+                y=verts[:, 1],
+                z=verts[:, 0],
+                i=faces[:, 0],
+                j=faces[:, 1],
+                k=faces[:, 2],
+                opacity=0.65,
+                flatshading=False,
+                hoverinfo="skip",
+            )
+        ]
+    )
+
+    fig.update_layout(
+        title=title,
+        scene=dict(
+            xaxis_title="X (µm)",
+            yaxis_title="Y (µm)",
+            zaxis_title="Z (µm)",
+            aspectmode="data",
+        ),
+        margin=dict(l=0, r=0, b=0, t=45),
+        height=650,
+    )
+    return fig
+
+
+def _pdf_overlay_rgb(img2d, mask2d):
+    """
+    PDF用のRGB overlay。
+    grayscaleをRGB化し、mask内を青く薄く重ね、境界をシアン相当にする。
+    """
+    g = (norm_disp(img2d) * 255).astype(np.uint8)
+    rgb = np.repeat(g[..., None], 3, axis=2).astype(np.float32)
+
+    m = np.asarray(mask2d, dtype=bool)
+    if np.any(m):
+        alpha = 0.32
+        blue = np.zeros_like(rgb)
+        blue[..., 2] = 255
+        rgb[m] = (1 - alpha) * rgb[m] + alpha * blue[m]
+
+        edge = m ^ ndi.binary_erosion(m)
+        rgb[edge, 0] = 0
+        rgb[edge, 1] = 255
+        rgb[edge, 2] = 255
+
+    return np.clip(rgb, 0, 255).astype(np.uint8)
+
+
+def build_mask_comparison_pdf(
+    raw,
+    records,
+    results,
+    file_names,
+    px,
+    py,
+    dz,
+    selected_nuclei=None,
+    include_all_z=False,
+):
+    """
+    PDF:
+      - 1ページ目: 解析サマリー
+      - 以降: 1ページに2 Z slices
+        Original / Binary mask / Overlay の3列比較
+    """
+    if selected_nuclei is None:
+        selected_nuclei = [int(r["nucleus"]) for r in records]
+    else:
+        selected_nuclei = [int(x) for x in selected_nuclei]
+
+    buf = BytesIO()
+
+    with PdfPages(buf) as pdf:
+        # ---------------- Summary page ----------------
+        fig = plt.figure(figsize=(11.69, 8.27))  # A4 landscape
+        ax = fig.add_axes([0.04, 0.06, 0.92, 0.88])
+        ax.axis("off")
+
+        ax.text(
+            0.0, 0.98,
+            "3D Nuclear Volume - Image / Mask Comparison Report",
+            fontsize=18, fontweight="bold", va="top",
+        )
+        ax.text(
+            0.0, 0.92,
+            f"Voxel size: X={float(px):.4f} um, Y={float(py):.4f} um, Z={float(dz):.4f} um",
+            fontsize=10, va="top",
+        )
+
+        table_rows = []
+        for nuc in selected_nuclei:
+            row = results[results["Nucleus"] == nuc]
+            if row.empty:
+                continue
+            rr = row.iloc[0]
+            table_rows.append([
+                str(nuc),
+                f"{float(rr['Volume (µm³)']):.3f}",
+                str(int(rr["Voxel count"])),
+                str(int(rr["Z start"])),
+                str(int(rr["Z end"])),
+                str(rr.get("Mask source", "Standard")),
+            ])
+
+        if table_rows:
+            tbl = ax.table(
+                cellText=table_rows,
+                colLabels=[
+                    "Nucleus", "Volume (um3)", "Voxels",
+                    "Z start", "Z end", "Mask source"
+                ],
+                loc="upper left",
+                cellLoc="center",
+                bbox=[0.0, 0.30, 1.0, 0.53],
+            )
+            tbl.auto_set_font_size(False)
+            tbl.set_fontsize(9)
+
+        ax.text(
+            0.0, 0.22,
+            "Each following row shows: Original image | Binary mask | Overlay.",
+            fontsize=10,
+        )
+        ax.text(
+            0.0, 0.17,
+            "Cyan/blue areas are the voxels used for volume calculation.",
+            fontsize=10,
+        )
+        ax.text(
+            0.0, 0.12,
+            "Volume = mask voxel count x Pixel X x Pixel Y x Z spacing.",
+            fontsize=10,
+        )
+
+        pdf.savefig(fig, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+
+        # ---------------- Image/mask pages ----------------
+        for nuc in selected_nuclei:
+            rec = next(
+                (r for r in records if int(r["nucleus"]) == int(nuc)),
+                None,
+            )
+            if rec is None:
+                continue
+
+            roi = rec["roi"]
+            mask3d = np.asarray(rec["mask"], dtype=bool)
+
+            if include_all_z:
+                z_indices = list(range(raw.shape[0]))
+            else:
+                z_indices = np.where(np.any(mask3d, axis=(1, 2)))[0].tolist()
+
+            if not z_indices:
+                continue
+
+            # 2 slices / page, each slice has 3 panels
+            for page_start in range(0, len(z_indices), 2):
+                page_z = z_indices[page_start:page_start + 2]
+
+                fig, axes = plt.subplots(
+                    2, 3,
+                    figsize=(11.69, 8.27),
+                    squeeze=False,
+                )
+
+                for row_i in range(2):
+                    for col_i in range(3):
+                        axes[row_i, col_i].axis("off")
+
+                for row_i, zg in enumerate(page_z):
+                    img = raw[
+                        zg,
+                        roi["y0"]:roi["y1"],
+                        roi["x0"]:roi["x1"],
+                    ]
+                    m = mask3d[zg]
+
+                    filename = (
+                        file_names[zg]
+                        if zg < len(file_names)
+                        else f"Z_{zg + 1}"
+                    )
+
+                    axes[row_i, 0].imshow(norm_disp(img), cmap="gray")
+                    axes[row_i, 0].set_title(
+                        f"Original - Z {zg + 1}\n{filename}",
+                        fontsize=9,
+                    )
+
+                    axes[row_i, 1].imshow(m, cmap="gray", vmin=0, vmax=1)
+                    axes[row_i, 1].set_title(
+                        f"Binary mask - Z {zg + 1}",
+                        fontsize=9,
+                    )
+
+                    axes[row_i, 2].imshow(_pdf_overlay_rgb(img, m))
+                    axes[row_i, 2].set_title(
+                        f"Overlay - Z {zg + 1}",
+                        fontsize=9,
+                    )
+
+                    for col_i in range(3):
+                        axes[row_i, col_i].axis("off")
+
+                source_row = results[results["Nucleus"] == int(nuc)]
+                source = (
+                    str(source_row.iloc[0].get("Mask source", "Standard"))
+                    if not source_row.empty
+                    else "Standard"
+                )
+
+                fig.suptitle(
+                    f"Nucleus {nuc} - mask source: {source}",
+                    fontsize=14,
+                )
+                fig.tight_layout(rect=[0, 0, 1, 0.95])
+                pdf.savefig(fig, dpi=150)
+                plt.close(fig)
+
+    buf.seek(0)
+    return buf.getvalue()
+
 
 
 # ============================================================
@@ -518,7 +786,7 @@ files=st.file_uploader('2D TIFをすべて選択',type=['tif','tiff'],accept_mul
 if not files: st.stop()
 sig=tuple((f.name,f.size) for f in files)
 if st.session_state.sig!=sig:
-    st.session_state.sig=sig; st.session_state.raw=None; st.session_state.cands=None; st.session_state.records=None; st.session_state.table=None; st.session_state.done=False; st.session_state.selected=None; st.session_state.sam_click=None; st.session_state.sam_2d=None; st.session_state.sam_3d=None; st.session_state.sam_target_nucleus=None; st.session_state.sam_target_z=None
+    st.session_state.sig=sig; st.session_state.raw=None; st.session_state.cands=None; st.session_state.records=None; st.session_state.table=None; st.session_state.done=False; st.session_state.selected=None; st.session_state.sam_click=None; st.session_state.sam_2d=None; st.session_state.sam_3d=None; st.session_state.sam_target_nucleus=None; st.session_state.sam_target_z=None; st.session_state.report_pdf=None; st.session_state.report_pdf_name=None
 if st.session_state.raw is None:
     with st.spinner('読み込み中...'): st.session_state.raw=load_stack(files,channel)
 raw=st.session_state.raw
@@ -554,7 +822,7 @@ if st.button('🧠 選択ROIを解析',type='primary',width='stretch',disabled=n
             m=measure(mask,float(px),float(py),float(dz)); nuc=len(rows)+1
             rows.append({'Nucleus':nuc,'Candidate ROI':c['candidate'],'Volume (µm³)':round(m['volume'],3),'Voxel count':m['vox'],'Z start':m['zstart'],'Z end':m['zend'],'Z slices':m['zs'],'Z tracked slices':info['tracked'],'StarDist seed voxels':info['seed_vox'],'Whole/seed ratio':round(info['whole_vox']/max(info['seed_vox'],1),2),'High threshold':round(info['high'],4),'Low threshold':round(info['low'],4),'Tail threshold':round(info['tail'],4),'StarDist detected':detected,'Used probability':used_prob,'n_tiles':'×'.join(map(str,nt)),'Memory retries':mem,'Time (s)':round(time.perf_counter()-t0,2),'Mask source':'Standard'})
             records.append({'nucleus':nuc,'candidate':c['candidate'],'roi':{'y0':c['y0'],'y1':c['y1'],'x0':c['x0'],'x1':c['x1']},'mask':mask})
-        st.session_state.records=records; st.session_state.table=pd.DataFrame(rows); st.session_state.done=True; prog.progress(1.); status.success('完了')
+        st.session_state.records=records; st.session_state.table=pd.DataFrame(rows); st.session_state.report_pdf=None; st.session_state.report_pdf_name=None; st.session_state.done=True; prog.progress(1.); status.success('完了')
     except Exception as e: st.exception(e); st.stop()
 if not st.session_state.done: st.stop()
 
@@ -568,6 +836,25 @@ nuclei=[r['nucleus'] for r in records]; n=st.selectbox('核',nuclei); rec=next(r
 fig=overlay(raw,rec,mip=True); st.pyplot(fig); plt.close(fig)
 p=np.where(np.any(rec['mask'],axis=(1,2)))[0]; default=int(round((p.min()+p.max())/2))+1 if len(p) else raw.shape[0]//2
 z=st.slider('表示するglobal Z',1,int(raw.shape[0]),int(default)); fig=overlay(raw,rec,z=z); st.pyplot(fig); plt.close(fig)
+
+
+st.subheader("3Dマスク表示")
+st.caption(
+    "体積計算に実際に使っている最終3Dマスクを立体表示します。"
+    "ドラッグで回転、ホイールで拡大縮小できます。"
+)
+fig3d = make_3d_mask_figure(
+    rec["mask"],
+    px=float(px),
+    py=float(py),
+    dz=float(dz),
+    title=f"Nucleus {n} - 3D mask",
+)
+if fig3d is None:
+    st.warning("この核は3D表面を生成できませんでした。")
+else:
+    st.plotly_chart(fig3d, width="stretch", config={"displaylogo": False})
+
 
 
 st.header("⑥ 認識不良時だけ MobileSAM AI補助")
@@ -798,12 +1085,82 @@ if st.session_state.sam_3d is not None:
         st.session_state.sam_2d = None
         st.session_state.sam_3d = None
         st.session_state.sam_click = None
+        st.session_state.report_pdf = None
+        st.session_state.report_pdf_name = None
 
         st.success(f"核{sam_nucleus}をMobileSAM補助マスクに置き換えました。")
         st.rerun()
 
 
-st.header('⑦ CSV')
+
+st.header("⑦ 画像 / マスク比較PDF")
+
+st.caption(
+    "アップロードした元画像、体積計算に使った二値マスク、"
+    "元画像への重ね合わせをPDFで保存できます。"
+)
+
+pdf_scope = st.radio(
+    "PDFに含める核",
+    ["現在選択中の核だけ", "解析した全核"],
+    horizontal=True,
+    key="pdf_scope",
+)
+
+pdf_all_z = st.checkbox(
+    "マスクが存在しないZ sliceも含める",
+    value=False,
+    help=(
+        "OFFでは、核マスクが存在するZ sliceだけをPDFにします。"
+        "ONではZ-stack全枚を含めるためPDFが大きくなります。"
+    ),
+)
+
+if pdf_scope == "現在選択中の核だけ":
+    pdf_nuclei = [int(n)]
+    pdf_suffix = f"nucleus_{int(n)}"
+else:
+    pdf_nuclei = [int(x) for x in nuclei]
+    pdf_suffix = "all_nuclei"
+
+if st.button(
+    "📄 比較PDFを作成",
+    width="stretch",
+):
+    with st.spinner("元画像とマスクの比較PDFを作成しています..."):
+        sorted_file_names = [
+            f.name for f in sorted(files, key=lambda f: natural_key(f.name))
+        ]
+        st.session_state.report_pdf = build_mask_comparison_pdf(
+            raw=raw,
+            records=records,
+            results=results,
+            file_names=sorted_file_names,
+            px=float(px),
+            py=float(py),
+            dz=float(dz),
+            selected_nuclei=pdf_nuclei,
+            include_all_z=bool(pdf_all_z),
+        )
+        st.session_state.report_pdf_name = (
+            f"nuclear_mask_comparison_{pdf_suffix}.pdf"
+        )
+    st.success("比較PDFを作成しました。")
+
+if st.session_state.report_pdf is not None:
+    st.download_button(
+        "📥 比較PDFをダウンロード",
+        data=st.session_state.report_pdf,
+        file_name=(
+            st.session_state.report_pdf_name
+            or "nuclear_mask_comparison.pdf"
+        ),
+        mime="application/pdf",
+        width="stretch",
+    )
+
+
+st.header('⑧ CSV')
 csv=results.to_csv(index=False).encode('utf-8-sig'); st.download_button('📥 CSVを保存',csv,'3D_nuclear_volume_AI_edge.csv','text/csv')
 
 with st.expander('メモリ情報'):
