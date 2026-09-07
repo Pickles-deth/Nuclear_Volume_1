@@ -5,8 +5,12 @@ scipy
 scikit-image
 tifffile
 matplotlib
-plotly
 tensorflow
 stardist
 csbdeep
 imagecodecs
+Pillow
+streamlit-image-coordinates==0.4.1
+torch
+torchvision
+git+https://github.com/ChaoningZhang/MobileSAM.git
