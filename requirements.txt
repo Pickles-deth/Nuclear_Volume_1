@@ -15,4 +15,5 @@ torch
 torchvision
 timm
 plotly
+cellpose
 git+https://github.com/ChaoningZhang/MobileSAM.git
